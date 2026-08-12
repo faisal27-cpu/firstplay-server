@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import { LIBRARY } from './library.js';
+import { screenPhoto, MODERATION_ON, REJECTION_TEXT } from './moderation.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -12,6 +13,9 @@ const pool = new Pool({
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '12mb' }));
+
+// How many reports before a claim is hidden pending review.
+const HIDE_AFTER_REPORTS = 2;
 
 // ---------- schema ----------
 await pool.query(`
@@ -29,6 +33,13 @@ await pool.query(`
     PRIMARY KEY (user_id, friend_id)
   );
   CREATE INDEX IF NOT EXISTS friendships_user_idx ON friendships (user_id);
+
+  CREATE TABLE IF NOT EXISTS blocks (
+    user_id    TEXT NOT NULL,
+    blocked_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, blocked_id)
+  );
 
   CREATE TABLE IF NOT EXISTS claims (
     id           BIGSERIAL PRIMARY KEY,
@@ -51,6 +62,17 @@ await pool.query(`
   CREATE INDEX IF NOT EXISTS claims_track_idx ON claims (track_id);
   CREATE INDEX IF NOT EXISTS claims_user_idx ON claims (user_id);
 
+  ALTER TABLE claims ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false;
+  ALTER TABLE claims ADD COLUMN IF NOT EXISTS screened BOOLEAN NOT NULL DEFAULT false;
+
+  CREATE TABLE IF NOT EXISTS reports (
+    claim_id   BIGINT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    user_id    TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (claim_id, user_id)
+  );
+
   CREATE TABLE IF NOT EXISTS reactions (
     claim_id BIGINT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
     user_id  TEXT NOT NULL,
@@ -70,9 +92,6 @@ await pool.query(`
 `);
 
 // ---------- identity ----------
-// No login. The app sends a random device id it generated on first launch.
-// A short friend code is what people actually share with each other.
-
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1
 const WORDS = ['echo', 'dusk', 'ferry', 'amber', 'pine', 'harbor', 'lark', 'onyx', 'juno', 'wren'];
 
@@ -83,7 +102,9 @@ async function ensureUser(id, preferredName) {
   const { rows } = await pool.query('SELECT user_id, username, code FROM users WHERE user_id = $1', [id]);
   if (rows.length) return rows[0];
 
-  const username = (preferredName || WORDS[Math.floor(Math.random() * WORDS.length)] + Math.floor(Math.random() * 900 + 100)).slice(0, 24);
+  const username = (preferredName ||
+    WORDS[Math.floor(Math.random() * WORDS.length)] + Math.floor(Math.random() * 900 + 100)
+  ).slice(0, 24);
 
   for (let attempt = 0; attempt < 6; attempt++) {
     try {
@@ -93,7 +114,7 @@ async function ensureUser(id, preferredName) {
       );
       return made[0];
     } catch (e) {
-      if (e.code !== '23505') throw e; // retry only on code collision
+      if (e.code !== '23505') throw e;
     }
   }
   throw new Error('Could not allocate a friend code');
@@ -113,7 +134,7 @@ async function requireUser(req, res, next) {
   }
 }
 
-// ---------- spotify / library search ----------
+// ---------- search ----------
 let tokenCache = { value: null, expires: 0 };
 const HAS_SPOTIFY = !!(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
 
@@ -182,6 +203,11 @@ const SELECT = `
          c.note, (c.photo IS NOT NULL) AS photo, c.world_first, c.created_at
   FROM claims c LEFT JOIN users u ON u.user_id = c.user_id`;
 
+// Everything a viewer sees is filtered: hidden claims and blocked people vanish.
+const VISIBLE = (viewerParam) => `
+  c.hidden = false
+  AND c.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ${viewerParam})`;
+
 async function hydrate(rows, viewerId) {
   if (!rows.length) return [];
   const ids = rows.map((r) => r.id);
@@ -197,11 +223,17 @@ async function hydrate(rows, viewerId) {
   );
 
   let friendSet = new Set();
+  let reportedSet = new Set();
   if (viewerId) {
     const { rows: fr } = await pool.query(
       'SELECT friend_id FROM friendships WHERE user_id = $1', [viewerId]
     );
     friendSet = new Set(fr.map((f) => f.friend_id));
+
+    const { rows: rp } = await pool.query(
+      'SELECT claim_id FROM reports WHERE user_id = $1 AND claim_id = ANY($2)', [viewerId, ids]
+    );
+    reportedSet = new Set(rp.map((r) => Number(r.claim_id)));
   }
 
   return rows.map((r) => {
@@ -216,6 +248,7 @@ async function hydrate(rows, viewerId) {
       userId: r.user_id,
       username: r.username,
       isFriend: friendSet.has(r.user_id),
+      reported: reportedSet.has(Number(r.id)),
       note: r.note ?? undefined,
       photoUri: r.photo ? `${process.env.PUBLIC_URL ?? ''}/photo/${r.id}` : undefined,
       worldFirst: r.world_first,
@@ -237,9 +270,10 @@ app.get('/me', requireUser, async (req, res) => {
   try {
     const { rows: counts } = await pool.query(
       `SELECT
-         (SELECT COUNT(*) FROM claims WHERE user_id = $1) AS spots,
-         (SELECT COUNT(*) FROM claims WHERE user_id = $1 AND world_first) AS firsts,
-         (SELECT COUNT(*) FROM friendships WHERE user_id = $1) AS friends`,
+         (SELECT COUNT(*) FROM claims WHERE user_id = $1 AND hidden = false) AS spots,
+         (SELECT COUNT(*) FROM claims WHERE user_id = $1 AND world_first AND hidden = false) AS firsts,
+         (SELECT COUNT(*) FROM friendships WHERE user_id = $1) AS friends,
+         (SELECT COUNT(*) FROM blocks WHERE user_id = $1) AS blocked`,
       [req.userId]
     );
     res.json({
@@ -249,6 +283,8 @@ app.get('/me', requireUser, async (req, res) => {
       spots: Number(counts[0].spots),
       firsts: Number(counts[0].firsts),
       friends: Number(counts[0].friends),
+      blocked: Number(counts[0].blocked),
+      photoScreening: MODERATION_ON,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -266,12 +302,24 @@ app.post('/me', requireUser, async (req, res) => {
   }
 });
 
+app.delete('/me', requireUser, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM claims WHERE user_id = $1', [req.userId]);
+    await pool.query('DELETE FROM friendships WHERE user_id = $1 OR friend_id = $1', [req.userId]);
+    await pool.query('DELETE FROM blocks WHERE user_id = $1 OR blocked_id = $1', [req.userId]);
+    await pool.query('DELETE FROM users WHERE user_id = $1', [req.userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- friends ----------
 app.get('/friends', requireUser, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT u.user_id, u.username, u.code,
-              (SELECT COUNT(*) FROM claims WHERE user_id = u.user_id) AS spots,
+              (SELECT COUNT(*) FROM claims WHERE user_id = u.user_id AND hidden = false) AS spots,
               EXISTS (SELECT 1 FROM friendships f2
                       WHERE f2.user_id = u.user_id AND f2.friend_id = $1) AS follows_back
        FROM friendships f JOIN users u ON u.user_id = f.friend_id
@@ -280,11 +328,8 @@ app.get('/friends', requireUser, async (req, res) => {
       [req.userId]
     );
     res.json(rows.map((r) => ({
-      userId: r.user_id,
-      username: r.username,
-      code: r.code,
-      spots: Number(r.spots),
-      followsBack: r.follows_back,
+      userId: r.user_id, username: r.username, code: r.code,
+      spots: Number(r.spots), followsBack: r.follows_back,
     })));
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -315,8 +360,7 @@ app.post('/friends', requireUser, async (req, res) => {
 app.delete('/friends/:id', requireUser, async (req, res) => {
   try {
     await pool.query(
-      'DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2',
-      [req.userId, req.params.id]
+      'DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2', [req.userId, req.params.id]
     );
     res.json({ ok: true });
   } catch (e) {
@@ -329,6 +373,7 @@ app.get('/feed', requireUser, async (req, res) => {
     const { rows } = await pool.query(
       `${SELECT}
        WHERE c.user_id IN (SELECT friend_id FROM friendships WHERE user_id = $1)
+         AND ${VISIBLE('$1')}
        ORDER BY c.created_at DESC LIMIT 100`,
       [req.userId]
     );
@@ -338,16 +383,83 @@ app.get('/feed', requireUser, async (req, res) => {
   }
 });
 
+// ---------- blocking ----------
+app.get('/blocks', requireUser, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT b.blocked_id, COALESCE(u.username, 'someone') AS username
+       FROM blocks b LEFT JOIN users u ON u.user_id = b.blocked_id
+       WHERE b.user_id = $1 ORDER BY u.username`,
+      [req.userId]
+    );
+    res.json(rows.map((r) => ({ userId: r.blocked_id, username: r.username })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/blocks', requireUser, async (req, res) => {
+  const target = (req.body?.userId ?? '').toString();
+  if (!target || target === req.userId) return res.status(400).json({ error: 'Bad target' });
+  try {
+    await pool.query(
+      'INSERT INTO blocks (user_id, blocked_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [req.userId, target]
+    );
+    // Blocking someone also stops following them.
+    await pool.query(
+      'DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2', [req.userId, target]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/blocks/:id', requireUser, async (req, res) => {
+  try {
+    await pool.query(
+      'DELETE FROM blocks WHERE user_id = $1 AND blocked_id = $2', [req.userId, req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- reporting ----------
+app.post('/claims/:id/report', requireUser, async (req, res) => {
+  const reason = (req.body?.reason ?? 'other').toString().slice(0, 40);
+  try {
+    await pool.query(
+      'INSERT INTO reports (claim_id, user_id, reason) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+      [req.params.id, req.userId, reason]
+    );
+    const { rows } = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM reports WHERE claim_id = $1', [req.params.id]
+    );
+    let hidden = false;
+    if (rows[0].n >= HIDE_AFTER_REPORTS) {
+      await pool.query('UPDATE claims SET hidden = true WHERE id = $1', [req.params.id]);
+      hidden = true;
+    }
+    res.json({ ok: true, reports: rows[0].n, hidden });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- claims ----------
-app.get('/claims', async (req, res) => {
+app.get('/claims', requireUser, async (req, res) => {
   const cells = (req.query.cells ?? '').toString().split(',').filter(Boolean);
-  const viewer = req.header('x-user-id') ?? null;
   if (!cells.length) return res.json([]);
   try {
     const { rows } = await pool.query(
-      `${SELECT} WHERE c.cell = ANY($1) ORDER BY c.created_at DESC LIMIT 500`, [cells]
+      `${SELECT} WHERE c.cell = ANY($2) AND ${VISIBLE('$1')}
+       ORDER BY c.created_at DESC LIMIT 500`,
+      [req.userId, cells]
     );
-    res.json(await hydrate(rows, viewer));
+    res.json(await hydrate(rows, req.userId));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -356,7 +468,8 @@ app.get('/claims', async (req, res) => {
 app.get('/claims/mine', requireUser, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `${SELECT} WHERE c.user_id = $1 ORDER BY c.created_at DESC LIMIT 200`, [req.userId]
+      `${SELECT} WHERE c.user_id = $1 AND c.hidden = false
+       ORDER BY c.created_at DESC LIMIT 200`, [req.userId]
     );
     res.json(await hydrate(rows, req.userId));
   } catch (e) {
@@ -364,9 +477,23 @@ app.get('/claims/mine', requireUser, async (req, res) => {
   }
 });
 
+app.delete('/claims/:id', requireUser, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'DELETE FROM claims WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'Not yours to delete' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/photo/:id', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT photo FROM claims WHERE id = $1', [req.params.id]);
+    const { rows } = await pool.query(
+      'SELECT photo FROM claims WHERE id = $1 AND hidden = false', [req.params.id]
+    );
     if (!rows[0]?.photo) return res.status(404).end();
     res.set('Content-Type', 'image/jpeg');
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
@@ -380,6 +507,15 @@ app.post('/claims', requireUser, async (req, res) => {
   const { cell, track, lat, lng, note, photoBase64 } = req.body ?? {};
   if (!cell || !track?.id || typeof lat !== 'number' || typeof lng !== 'number') {
     return res.status(400).json({ error: 'Bad payload' });
+  }
+
+  // Screen the photo BEFORE it touches the database.
+  const verdict = await screenPhoto(photoBase64);
+  if (!verdict.ok) {
+    return res.status(422).json({
+      error: REJECTION_TEXT[verdict.reason] ?? "That photo can't be posted here.",
+      rejected: verdict.reason,
+    });
   }
 
   const client = await pool.connect();
@@ -401,14 +537,14 @@ app.post('/claims', requireUser, async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO claims
         (cell, track_id, track_name, track_artist, track_art, user_id, username,
-         note, photo, lat, lng, world_first)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         note, photo, lat, lng, world_first, screened)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING id`,
       [
         cell, track.id, track.name, track.artist, track.art ?? null,
         req.userId, req.user.username,
         note?.slice(0, 200) ?? null, photoBase64 ?? null,
-        lat, lng, seen.length === 0,
+        lat, lng, seen.length === 0, verdict.checked,
       ]
     );
 
@@ -463,7 +599,12 @@ app.post('/claims/:id/comments', requireUser, async (req, res) => {
 });
 
 app.get('/', (_req, res) =>
-  res.json({ ok: true, service: 'firstplay', search: HAS_SPOTIFY ? 'spotify' : 'built-in library' })
+  res.json({
+    ok: true,
+    service: 'firstplay',
+    search: HAS_SPOTIFY ? 'spotify' : 'built-in library',
+    photoScreening: MODERATION_ON ? 'on' : 'off (reports only)',
+  })
 );
 
 const port = process.env.PORT || 8787;
