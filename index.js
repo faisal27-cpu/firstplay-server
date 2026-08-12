@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import { LIBRARY } from './library.js';
-import { screenPhoto, MODERATION_ON, REJECTION_TEXT } from './moderation.js';
+import { screenPhoto, rawScores, MODERATION_ON, REJECTION_TEXT, LIMITS, RANK } from './moderation.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -595,6 +595,50 @@ app.post('/claims/:id/comments', requireUser, async (req, res) => {
     res.json((await hydrate(rows, req.userId))[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- screening check ----------
+// Paste an image URL in a browser to see exactly what Google scores it and
+// whether the current thresholds would block it. Nothing is saved.
+//   /screen-check?url=https://example.com/photo.jpg
+app.get('/screen-check', async (req, res) => {
+  if (!MODERATION_ON) {
+    return res.json({ error: 'GOOGLE_VISION_API_KEY is not set on this server' });
+  }
+  const url = (req.query.url ?? '').toString();
+  if (!/^https?:\/\//.test(url)) {
+    return res.json({ error: 'Add ?url= followed by a direct link to a .jpg or .png' });
+  }
+  try {
+    const img = await fetch(url);
+    if (!img.ok) return res.json({ error: `Could not fetch that image (${img.status})` });
+
+    const type = img.headers.get('content-type') ?? '';
+    if (!type.startsWith('image/')) {
+      return res.json({ error: `That URL is ${type || 'not an image'}. Use a direct image link.` });
+    }
+
+    const base64 = Buffer.from(await img.arrayBuffer()).toString('base64');
+    const scores = await rawScores(base64);
+    if (!scores) return res.json({ error: 'Vision returned no scores for that image' });
+
+    const blockedBy = Object.entries(LIMITS)
+      .filter(([k, limit]) => (RANK[scores[k]] ?? 0) >= limit)
+      .map(([k]) => k);
+
+    res.json({
+      verdict: blockedBy.length ? 'BLOCKED' : 'allowed',
+      blockedBy,
+      scores,
+      thresholds: Object.fromEntries(
+        Object.entries(LIMITS).map(([k, v]) => [
+          k, Object.keys(RANK).find((r) => RANK[r] === v),
+        ])
+      ),
+    });
+  } catch (e) {
+    res.json({ error: e.message });
   }
 });
 
